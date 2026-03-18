@@ -1,99 +1,181 @@
 #!/usr/bin/env python3
 """
-MACE Training Script with MLflow Tracking
-==========================================
-Train MACE interatomic potentials on DFT data with full experiment logging.
+MACE Training on Intel Arc A750
+================================
+Train MACE interatomic potentials on pesticide DFT data using the GPU worker
+on media-srv, with MLflow experiment tracking.
 
-Usage:
-    python train_mace.py --data /data/pesticides_dir_2/mace_training.extxyz
-    python train_mace.py --data data.extxyz --cutoff 5.0 --channels 64 --epochs 100
+The training data lives on shared ZFS storage (/workspace or /data) accessible
+to both dev-srv (where I run analysis) and media-srv (where the GPU lives).
+
+Usage (from dev-srv):
+    # Direct GPU training via SSH to media-srv gpu-worker
+    ssh albd@10.10.49.9 "docker exec gpu-worker python /workspace/train_mace.py \\
+        --name pesticide-mace-v1 \\
+        --train_file /workspace/mace_training.extxyz \\
+        --r_max 6.0 --num_channels 128 --max_epochs 200"
+
+    # Or via the gpu-submit helper
+    ~/gpu-submit.sh train_mace.py --name test --train_file /workspace/mace_training.extxyz
+
+Local dry-run (no GPU, just logs config to MLflow):
+    python train_mace.py --name test --train_file /data/pesticides_dir_2/mace_training.extxyz --dry-run
 """
 import argparse
 import json
-import time
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train MACE model with MLflow tracking")
-    parser.add_argument("--data", type=str, required=True, help="Path to training extxyz file")
-    parser.add_argument("--cutoff", type=float, default=6.0, help="Interaction cutoff (Angstrom)")
-    parser.add_argument("--channels", type=int, default=128, help="Number of channels")
-    parser.add_argument("--max-L", type=int, default=1, help="Maximum angular momentum")
-    parser.add_argument("--epochs", type=int, default=200, help="Maximum training epochs")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--energy-weight", type=float, default=1.0, help="Energy loss weight")
-    parser.add_argument("--force-weight", type=float, default=100.0, help="Force loss weight")
-    parser.add_argument("--train-frac", type=float, default=0.8, help="Training fraction")
-    parser.add_argument("--val-frac", type=float, default=0.1, help="Validation fraction")
-    parser.add_argument("--mlflow-uri", type=str, default="http://localhost:5000", help="MLflow tracking URI")
-    parser.add_argument("--experiment", type=str, default="mace-training-pipeline", help="MLflow experiment name")
-    parser.add_argument("--run-name", type=str, default=None, help="MLflow run name")
-    parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "xpu", "cuda"], help="Training device")
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="Train MACE on Intel Arc A750 with MLflow tracking")
 
-def count_structures(extxyz_path):
-    """Count structures in an extxyz file."""
-    return sum(1 for line in open(extxyz_path) if line.strip().isdigit())
+    # Required
+    p.add_argument("--name", required=True, help="Run name (used for MLflow and output dirs)")
+    p.add_argument("--train_file", required=True, help="Training data (extxyz)")
 
-def main():
-    args = parse_args()
-    data_path = Path(args.data)
+    # Model architecture
+    p.add_argument("--r_max", type=float, default=6.0, help="Cutoff radius (Angstrom)")
+    p.add_argument("--num_channels", type=int, default=128, help="Hidden irreps channels")
+    p.add_argument("--max_L", type=int, default=1, help="Max angular momentum")
+    p.add_argument("--num_interactions", type=int, default=2, help="Number of message passing layers")
+    p.add_argument("--correlation", type=int, default=3, help="Body order correlation")
 
-    if not data_path.exists():
-        raise FileNotFoundError(f"Training data not found: {data_path}")
+    # Training
+    p.add_argument("--max_epochs", type=int, default=200, help="Maximum epochs")
+    p.add_argument("--batch_size", type=int, default=32, help="Batch size")
+    p.add_argument("--lr", type=float, default=0.01, help="Learning rate")
+    p.add_argument("--weight_decay", type=float, default=5e-7, help="Weight decay")
+    p.add_argument("--energy_weight", type=float, default=1.0, help="Energy loss weight")
+    p.add_argument("--forces_weight", type=float, default=100.0, help="Forces loss weight")
+    p.add_argument("--valid_fraction", type=float, default=0.1, help="Validation fraction")
+    p.add_argument("--seed", type=int, default=42, help="Random seed")
 
-    n_structures = count_structures(data_path)
-    n_train = int(n_structures * args.train_frac)
-    n_val = int(n_structures * args.val_frac)
-    n_test = n_structures - n_train - n_val
+    # Infrastructure
+    p.add_argument("--device", default="xpu", choices=["cpu", "xpu", "cuda"], help="Training device")
+    p.add_argument("--work_dir", default="/workspace/mace_runs", help="Working directory for outputs")
+    p.add_argument("--mlflow_uri", default="http://10.10.49.104:5000", help="MLflow tracking URI")
+    p.add_argument("--dry-run", action="store_true", help="Log config to MLflow without training")
 
-    print(f"Data: {data_path} ({n_structures} structures)")
-    print(f"Split: {n_train} train / {n_val} val / {n_test} test")
-    print(f"Model: MACE (cutoff={args.cutoff}, channels={args.channels}, max_L={args.max_L})")
-    print(f"Training: {args.epochs} epochs, batch_size={args.batch_size}, lr={args.lr}")
+    return p.parse_args()
 
-    # Log to MLflow
+
+def log_to_mlflow(args, metrics=None):
+    """Log training configuration and results to MLflow on dev-srv."""
     try:
         import mlflow
         mlflow.set_tracking_uri(args.mlflow_uri)
-        mlflow.set_experiment(args.experiment)
+        mlflow.set_experiment("mace-training-pipeline")
 
-        run_name = args.run_name or f"mace-c{args.channels}-r{args.cutoff}"
-        with mlflow.start_run(run_name=run_name):
-            mlflow.log_param("data_file", str(data_path))
-            mlflow.log_param("n_structures", n_structures)
-            mlflow.log_param("n_train", n_train)
-            mlflow.log_param("n_val", n_val)
-            mlflow.log_param("n_test", n_test)
-            mlflow.log_param("cutoff", args.cutoff)
-            mlflow.log_param("num_channels", args.channels)
+        with mlflow.start_run(run_name=args.name):
+            # Architecture
+            mlflow.log_param("model", "MACE")
+            mlflow.log_param("r_max", args.r_max)
+            mlflow.log_param("num_channels", args.num_channels)
             mlflow.log_param("max_L", args.max_L)
-            mlflow.log_param("max_epochs", args.epochs)
+            mlflow.log_param("num_interactions", args.num_interactions)
+            mlflow.log_param("correlation", args.correlation)
+
+            # Training
+            mlflow.log_param("max_epochs", args.max_epochs)
             mlflow.log_param("batch_size", args.batch_size)
-            mlflow.log_param("learning_rate", args.lr)
+            mlflow.log_param("lr", args.lr)
             mlflow.log_param("energy_weight", args.energy_weight)
-            mlflow.log_param("force_weight", args.force_weight)
+            mlflow.log_param("forces_weight", args.forces_weight)
+            mlflow.log_param("valid_fraction", args.valid_fraction)
             mlflow.log_param("device", args.device)
-            mlflow.set_tag("model_type", "MACE")
+            mlflow.log_param("train_file", args.train_file)
 
-            # The actual MACE training call would go here:
-            # from mace.cli.run_train import run as mace_train
-            # mace_train(args_dict)
-            #
-            # For now, log the configuration. Full training requires
-            # the GPU worker on media-srv for XPU acceleration.
+            if metrics:
+                for k, v in metrics.items():
+                    mlflow.log_metric(k, v)
 
-            print(f"\nConfiguration logged to MLflow: {args.mlflow_uri}")
-            print(f"Experiment: {args.experiment}")
-            print(f"Run: {run_name}")
-            print("\nTo run actual MACE training on the GPU worker:")
-            print(f"  gpu-submit.sh scripts/train_mace.py --data {data_path} --device xpu")
+            # Log model artifact if it exists
+            model_path = Path(args.work_dir) / args.name / f"{args.name}.model"
+            if model_path.exists():
+                mlflow.log_artifact(str(model_path))
 
-    except ImportError:
-        print("MLflow not available - skipping experiment tracking")
+            mlflow.set_tag("gpu", "Intel Arc A750")
+            mlflow.set_tag("backend", "IPEX-LLM/SYCL" if args.device == "xpu" else args.device)
+
+        print(f"Logged to MLflow: {args.mlflow_uri}")
     except Exception as e:
-        print(f"MLflow logging failed: {e}")
+        print(f"MLflow logging failed (non-fatal): {e}")
+
+
+def run_training(args):
+    """Execute MACE training via the mace.cli.run_train entry point."""
+    os.makedirs(args.work_dir, exist_ok=True)
+
+    cmd = [
+        sys.executable, "-m", "mace.cli.run_train",
+        "--name", args.name,
+        "--train_file", args.train_file,
+        "--valid_fraction", str(args.valid_fraction),
+        "--r_max", str(args.r_max),
+        "--num_channels", str(args.num_channels),
+        "--max_L", str(args.max_L),
+        "--num_interactions", str(args.num_interactions),
+        "--correlation", str(args.correlation),
+        "--max_num_epochs", str(args.max_epochs),
+        "--batch_size", str(args.batch_size),
+        "--lr", str(args.lr),
+        "--weight_decay", str(args.weight_decay),
+        "--energy_weight", str(args.energy_weight),
+        "--forces_weight", str(args.forces_weight),
+        "--seed", str(args.seed),
+        "--device", args.device,
+        "--work_dir", args.work_dir,
+        "--model_dir", os.path.join(args.work_dir, args.name),
+        "--checkpoints_dir", os.path.join(args.work_dir, args.name, "checkpoints"),
+        "--results_dir", os.path.join(args.work_dir, args.name, "results"),
+        "--model", "MACE",
+        "--scaling", "rms_forces_scaling",
+        "--error_table", "PerAtomMAE",
+        "--default_dtype", "float32",
+    ]
+
+    print(f"\nStarting MACE training: {args.name}")
+    print(f"Device: {args.device}")
+    print(f"Data: {args.train_file}")
+    print(f"Output: {args.work_dir}/{args.name}/")
+    print(f"Command: { .join(cmd)}\n")
+
+    result = subprocess.run(cmd, capture_output=False)
+
+    if result.returncode == 0:
+        print(f"\nTraining complete: {args.name}")
+        # Parse results if available
+        results_file = Path(args.work_dir) / args.name / "results" / f"{args.name}_run-{args.seed}.txt"
+        metrics = {}
+        if results_file.exists():
+            for line in results_file.read_text().splitlines():
+                if "=" in line:
+                    key, val = line.split("=", 1)
+                    try:
+                        metrics[key.strip()] = float(val.strip())
+                    except ValueError:
+                        pass
+        return metrics
+    else:
+        print(f"Training failed with exit code {result.returncode}")
+        return None
+
+
+def main():
+    args = parse_args()
+
+    if args.dry_run:
+        print(f"DRY RUN: logging config for {args.name} to MLflow")
+        n_structures = sum(1 for l in open(args.train_file) if l.strip().isdigit())
+        print(f"Training data: {args.train_file} ({n_structures} structures)")
+        log_to_mlflow(args, metrics={"n_structures": n_structures})
+        return
+
+    metrics = run_training(args)
+    log_to_mlflow(args, metrics=metrics)
+
 
 if __name__ == "__main__":
     main()
