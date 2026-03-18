@@ -1,0 +1,17 @@
+model:
+  num_channels: 128
+  max_L: 1
+  num_interactions: 2
+  cutoff: 6.0
+training:
+  batch_size: 32
+  max_epochs: 200
+  learning_rate: 0.001
+  energy_weight: 1.0
+  force_weight: 100.0
+data:
+  train_file: "/data/pesticides_dir_2/mace_training.extxyz"
+  train_fraction: 0.8
+mlflow:
+  tracking_uri: "http://10.10.49.104:5000"
+  experiment_name: "mace-training-pipeline"
