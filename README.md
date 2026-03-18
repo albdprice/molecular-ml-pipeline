@@ -1,42 +1,37 @@
 # Molecular ML Pipeline
 
-End-to-end MLOps pipeline for training MACE neural network potentials on DFT data, with MLflow experiment tracking and GPU-accelerated inference.
+MLOps pipeline for training and evaluating MACE neural network potentials on DFT-computed molecular data, with experiment tracking via MLflow.
 
-## Overview
+## Motivation
 
-Demonstrates a production ML pipeline for molecular property prediction using [MACE](https://github.com/ACEsuit/mace). Training data: 28,576 DFT structures from a pesticide bond dissociation energy study (wB97M-D3BJ/def2-TZVPPD).
+I run large-scale DFT calculations (wB97M-D3BJ/def2-TZVPPD) on pesticide molecules and their radical fragments as part of a bond dissociation energy study. The resulting dataset — 28,576 structures with energies and forces — serves as training data for MACE interatomic potentials. This repository structures that workflow into a reproducible pipeline with proper experiment tracking.
 
-### Pipeline
+## Pipeline
 
 ```
-DFT (Psi4, wB97M-D3BJ/def2-TZVPPD) → Export (ASE extxyz) → MACE Training (Arc A750 GPU)
-    → MLflow Tracking → Model Evaluation → Deployment (ASE calculator)
+DFT (Psi4, wB97M-D3BJ/def2-TZVPPD)
+  → ASE extxyz export (energies in eV, forces in eV/Å)
+  → Train/val/test split
+  → MACE training (Intel Arc A750 via PyTorch XPU)
+  → MLflow logging (hyperparameters, metrics, model artifacts)
+  → Evaluation (energy MAE, force MAE, parity plots)
+  → Deployment as ASE calculator
 ```
-
-### Key Features
-- **28,576 real DFT structures** with energies and forces
-- **GPU training** on Intel Arc A750 via PyTorch XPU/SYCL
-- **MLflow** experiment tracking, model comparison, artifact storage
-- **Reproducible** conda environments and Docker containers
 
 ## Structure
 
-```
-├── notebooks/           # Jupyter notebooks for exploration and training
-├── scripts/             # CLI scripts for training and evaluation
-├── configs/             # MACE training configurations
-└── README.md
-```
+- `notebooks/` — Data exploration, training, evaluation, deployment demos
+- `scripts/` — CLI tools for training and batch evaluation
+- `configs/` — MACE training configurations (YAML)
 
-## Quick Start
+## Infrastructure
 
-```bash
-conda create -n mace-pipeline python=3.11 numpy scipy matplotlib
-pip install mace-torch ase mlflow scikit-learn
-jupyter lab notebooks/
-```
+Training runs on a self-hosted Proxmox cluster:
+- **GPU**: Intel Arc A750 (8GB VRAM, SYCL/Level-Zero via IPEX-LLM)
+- **Tracking**: MLflow at mlflow.albdchem.org
+- **Storage**: ZFS (tank/research for data, tank/ml-workspace for checkpoints)
+- **Notebooks**: JupyterLab at jupyter.albdchem.org
 
-## Related
+## Data
 
-- [adaptive-ml-potentials](https://github.com/albdprice/adaptive-ml-potentials) — Adaptive parameter learning
-- [psi4_xdm](https://github.com/albdprice/psi4_xdm) — XDM dispersion in Psi4
+The training data originates from ~1,445 pesticide parent molecules and ~25,640 radical fragments. Each structure includes atomic positions, DFT total energy, and analytical forces. Metadata: charge, spin multiplicity, SMILES, parent molecule ID.
