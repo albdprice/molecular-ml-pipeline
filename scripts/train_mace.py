@@ -54,6 +54,8 @@ def parse_args():
 
     # Infrastructure
     p.add_argument("--device", default="xpu", choices=["cpu", "xpu", "cuda"], help="Training device")
+    p.add_argument("--energy_key", default="energy", help="Energy key in extxyz")
+    p.add_argument("--forces_key", default="forces", help="Forces key in extxyz")
     p.add_argument("--work_dir", default="/workspace/mace_runs", help="Working directory for outputs")
     p.add_argument("--mlflow_uri", default="http://10.10.49.104:5000", help="MLflow tracking URI")
     p.add_argument("--dry-run", action="store_true", help="Log config to MLflow without training")
@@ -134,13 +136,16 @@ def run_training(args):
         "--scaling", "rms_forces_scaling",
         "--error_table", "PerAtomMAE",
         "--default_dtype", "float32",
+        "--E0s", "average",
+        "--energy_key", args.energy_key,
+        "--forces_key", args.forces_key,
     ]
 
     print(f"\nStarting MACE training: {args.name}")
     print(f"Device: {args.device}")
     print(f"Data: {args.train_file}")
     print(f"Output: {args.work_dir}/{args.name}/")
-    print(f"Command: { .join(cmd)}\n")
+    print("Command: " + " ".join(cmd))
 
     result = subprocess.run(cmd, capture_output=False)
 
